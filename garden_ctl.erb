@@ -1,0 +1,204 @@
+#!/bin/bash -e
+
+set -x
+
+RUN_DIR=/var/vcap/sys/run/garden
+LOG_DIR=/var/vcap/sys/log/garden
+PIDFILE=$RUN_DIR/garden.pid
+DATA_DIR=/var/vcap/data/garden
+
+<% if_p('garden.http_proxy') do |http_proxy| %>
+	export HTTP_PROXY=<%= http_proxy %>
+	export http_proxy=<%= http_proxy %>
+<% end %>
+<% if_p('garden.https_proxy') do |https_proxy| %>
+	export HTTPS_PROXY=<%= https_proxy %>
+	export https_proxy=<%= https_proxy %>
+<% end %>
+<% if_p('garden.no_proxy') do |no_proxy| %>
+	export NO_PROXY=<%= no_proxy %>
+	export no_proxy=<%= no_proxy %>
+<% end %>
+
+function setup() {
+  mkdir -p /var/vcap/sys/log/monit
+  exec 1>> /var/vcap/sys/log/monit/garden.log
+  exec 2>> /var/vcap/sys/log/monit/garden.log
+}
+
+# copied from https://github.com/concourse/concourse/blob/master/jobs/baggageclaim/templates/baggageclaim_ctl.erb
+# break out of bosh-lite device limitations
+function permit_device_control() {
+  local devices_mount_info=$(cat /proc/self/cgroup | grep devices)
+
+  if [ -z "$devices_mount_info" ]; then
+    # cgroups not set up; must not be in a container
+    return
+  fi
+
+  local devices_subsytems=$(echo $devices_mount_info | cut -d: -f2)
+  local devices_subdir=$(echo $devices_mount_info | cut -d: -f3)
+
+  if [ "$devices_subdir" = "/" ]; then
+    # we're in the root devices cgroup; must not be in a container
+    return
+  fi
+
+  cgroup_dir=${RUN_DIR}/devices-cgroup
+
+  if [ ! -e ${cgroup_dir} ]; then
+    # mount our container's devices subsystem somewhere
+    mkdir ${cgroup_dir}
+  fi
+
+  if ! mountpoint -q ${cgroup_dir}; then
+    mount -t cgroup -o $devices_subsytems none ${cgroup_dir}
+  fi
+
+  # permit our cgroup to do everything with all devices
+  echo a > ${cgroup_dir}${devices_subdir}/devices.allow || true
+}
+
+function create_loop_devices() {
+  amt=$1
+  for i in $(seq 0 $amt); do
+    mknod -m 0660 /dev/loop$i b 7 $i || true
+  done
+}
+
+case $1 in
+
+  start)
+    setup
+    if [ -f "$PIDFILE" ]; then
+      pid=$(head -1 "$PIDFILE")
+
+      if [ -n "$pid" ] && [ -e /proc/$pid ]; then
+        echo "Garden is already running (pid: $pid); aborting."
+        exit 1
+      fi
+
+      echo "Removing stale pidfile..."
+      rm "$PIDFILE"
+    fi
+
+    mkdir -p $RUN_DIR
+    mkdir -p $DATA_DIR
+    mkdir -p $LOG_DIR
+
+    export TMPDIR=/var/vcap/data/tmp
+    mkdir -p $TMPDIR
+
+    export PATH=/var/vcap/packages/shadow/sbin:$PATH
+    export PATH=/var/vcap/packages/shadow/sbin:$PATH
+    export PATH=/var/vcap/jobs/garden/bin:$PATH
+
+    cp /var/vcap/packages/tar/tar /var/vcap/packages/garden-linux/src/github.com/cloudfoundry-incubator/garden-linux/linux_backend/bin
+
+    mkdir -p /var/vcap/data/garden/depot
+
+    <% if p("garden.destroy_containers_on_start") %>
+    snapshots_path=""
+    <% else %>
+    snapshots_path=/var/vcap/data/garden/snapshots
+    <% end %>
+    graph_path=/var/vcap/data/garden/aufs_graph
+    mkdir -p $graph_path
+    chmod go-rx $graph_path
+
+    permit_device_control
+    create_loop_devices <%= p("garden.max_containers").to_i + 10 %>
+
+    ulimit -n 65536
+
+    echo 1 > /proc/sys/kernel/dmesg_restrict
+
+    echo $$ > $PIDFILE
+
+    exec /var/vcap/packages/garden-linux/bin/garden-linux \
+      -depot=/var/vcap/data/garden/depot \
+      -snapshots="${snapshots_path}" \
+      -graph=$graph_path \
+      -graphDriver=aufs \
+      -bin=/var/vcap/packages/garden-linux/src/github.com/cloudfoundry-incubator/garden-linux/linux_backend/bin \
+      -mtu=<%= p("garden.network_mtu") %> \
+      -listenNetwork=<%= p("garden.listen_network") %> \
+      -listenAddr=<%= p("garden.listen_address") %> \
+      -stateDir=/var/vcap/data/garden \
+      -policyURL=192.168.232.24 \
+      -denyNetworks=<%= p("garden.deny_networks").join(",") %> \
+      -allowNetworks=<%= p("garden.allow_networks").join(",") %> \
+      -allowHostAccess=<%= p("garden.allow_host_access") %> \
+      -networkPool=<%= p("garden.network_pool") %> \
+      -debugAddr=<%= p("garden.debug_listen_address") %> \
+      -rootfs=<%= p("garden.default_container_rootfs") %> \
+      -containerGraceTime=<%= p("garden.default_container_grace_time") %> \
+      -graphCleanupThresholdMB=<%= p("garden.graph_cleanup_threshold_in_mb") %> \
+      -maxContainers=<%= p("garden.max_containers") %> \
+    <% if_p("garden.log_level") do |log_level| %> \
+      -logLevel=<%= log_level %> \
+    <% end %> \
+    <% if_p("garden.docker_registry_endpoint") do |endpoint| %> \
+      -registry=<%= endpoint %> \
+    <% end %> \
+    <% if_p("garden.dropsonde.origin") do |origin| %> \
+      -dropsondeOrigin=<%= origin %> \
+    <% end %> \
+    <% if_p("garden.dropsonde.destination") do |destination| %> \
+      -dropsondeDestination=<%= destination %> \
+    <% end %> \
+    <% if_p("garden.tag") do |tag| %> \
+      -tag=<%= tag %> \
+    <% end %> \
+    <% if_p("garden.port_pool.start") do |start| %> \
+      -portPoolStart=<%= start %> \
+    <% end %> \
+    <% if_p("garden.port_pool.size") do |size| %> \
+      -portPoolSize=<%= size %> \
+    <% end %> \
+    <% p("garden.insecure_docker_registry_list").each do |url| %> \
+      -insecureDockerRegistry=<%= url %> \
+    <% end %> \
+    <% p("garden.persistent_image_list").each do |url| %> \
+      -persistentImage=<%= url %> \
+    <% end %> \
+    <% p("garden.dns_servers").each do |server| %> \
+      -dnsServer=<%= server %> \
+    <% end %> \
+      1>>$LOG_DIR/garden.stdout.log \
+      2>>$LOG_DIR/garden.stderr.log
+
+    ;;
+
+  stop)
+    setup
+    pid=$(cat $PIDFILE)
+
+    for i in $(seq 30); do
+      echo "sending TERM to ${pid}..."
+      if kill $pid; then
+        sleep 1
+      else
+        echo "exited"
+        exit 0
+      fi
+    done
+
+    echo "timed out; sending SIGQUIT followed by SIGKILL to ${pid}..."
+    if kill -QUIT $pid; then
+      sleep 5
+
+      echo "killing ${pid}..."
+      kill -9 $pid
+    fi
+
+    echo "killed"
+
+    ;;
+
+  *)
+    echo "Usage: $0 {start|stop}"
+
+    ;;
+
+esac
