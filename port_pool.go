@@ -141,7 +141,7 @@ func (p *PortPool) Release(port uint32) {
 		}
 	}
 	// find the right pool to add
-	for i:=0 ; i<len(p.pools); i++ {
+	for i:=len(p.pools) -1 ; i>=0; i- -//change {
 		if port >= p.start + uint32(i) * p.size/uint32(len(p.pools)){
 			p.pools[i] = append(p.pools[i], port)
 			return
